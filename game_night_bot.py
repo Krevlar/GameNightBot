@@ -162,7 +162,11 @@ class GameNightBot(discord.Client):
         games = suggestions[:MAX_POLL_ANSWERS]
         overflow = len(suggestions) - len(games)
 
-        poll = discord.Poll(question="What are we playing Monday night?", duration=POLL_DURATION)
+        poll = discord.Poll(
+            question="What are we playing Monday night?",
+            duration=POLL_DURATION,
+            multiple=True,
+        )
         for g in games:
             poll.add_answer(text=g["name"][:MAX_ANSWER_LEN])
         await channel.send(poll=poll)
