@@ -2,7 +2,8 @@
 Monday Game Night Bot
 ---------------------
 - Friday evening: posts a message asking for game suggestions.
-- Anyone suggests games with /suggest (Steam autocomplete).
+- Anyone suggests games with /suggest (Steam autocomplete) plus an optional
+  short pitch. The list is capped at 10 games, the most a Discord poll holds.
 - Sunday 7:00 PM: posts a native Discord poll of the suggestions, followed by a
   message with each game's description, genre(s), and player info from Steam.
 
@@ -44,6 +45,12 @@ POLL_DURATION = timedelta(hours=24)
 DATA_FILE = Path(os.environ.get("GAME_DATA_FILE", "suggestions.json"))
 MAX_POLL_ANSWERS = 10     # Discord limit
 MAX_ANSWER_LEN = 55       # Discord limit for poll answer text
+MAX_PITCH_LEN = 200       # our own limit for the /suggest pitch
+
+FULL_MESSAGE = (
+    f"🚫 The list is full ({MAX_POLL_ANSWERS}/{MAX_POLL_ANSWERS}). Discord polls hold at most "
+    f"{MAX_POLL_ANSWERS} games, so use `/suggestions` to see what's in and `/unsuggest` to make room."
+)
 
 STORE_SEARCH = "https://store.steampowered.com/api/storesearch/"
 APP_DETAILS = "https://store.steampowered.com/api/appdetails"
@@ -112,7 +119,10 @@ def player_info(details: dict) -> str:
 
 class GameNightBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default(),
+            allowed_mentions=discord.AllowedMentions.none(),  # pitches are user text; never ping
+        )
         self.tree = app_commands.CommandTree(self)
         self.session: aiohttp.ClientSession | None = None
 
@@ -139,8 +149,8 @@ class GameNightBot(discord.Client):
         await channel.send(
             "🎮 **Monday game night suggestions are open!**\n"
             "Use `/suggest` to add a game (start typing and pick from the Steam results). "
-            "Optionally add the player count, e.g. `players: 2-4`.\n"
-            "The poll goes up **Sunday at 7:00 PM**."
+            "Optionally add a short `pitch` on why it's a good pick.\n"
+            f"The list holds up to {MAX_POLL_ANSWERS} games, and the poll goes up **Sunday at 7:00 PM**."
         )
 
     # ---- Sunday: post poll + details ----
@@ -179,22 +189,20 @@ class GameNightBot(discord.Client):
 
         blocks = []
         for g, d in zip(games, details):
+            pitch = f"\n💬 *{g['suggested_by']}:* {g['pitch']}" if g.get("pitch") else ""
             if d:
                 desc = clean(d.get("short_description", "")) or "No description available."
                 if len(desc) > 300:
                     desc = desc[:297].rstrip() + "..."
                 genres = ", ".join(x["description"] for x in d.get("genres", [])) or "Unknown"
-                players = g.get("players") or player_info(d)
+                players = player_info(d)
                 blocks.append(
                     f"**{g['name']}**\n"
                     f"*Genre:* {genres}  |  *Players:* {players}\n"
-                    f"{desc}"
+                    f"{desc}{pitch}"
                 )
             else:
-                players = g.get("players") or "Unknown"
-                blocks.append(
-                    f"**{g['name']}**\n*Players:* {players}\n(No Steam info found.)"
-                )
+                blocks.append(f"**{g['name']}**\n(No Steam info found.){pitch}")
 
         if overflow:
             blocks.append(f"*{overflow} extra suggestion(s) didn't fit (Discord polls max out at 10).*")
@@ -233,9 +241,29 @@ async def game_autocomplete(interaction: discord.Interaction, current: str):
 
 
 @bot.tree.command(name="suggest", description="Suggest a game for Monday night")
-@app_commands.describe(game="Start typing a game name", players="Optional player count, e.g. 2-4")
+@app_commands.describe(
+    game="Start typing a game name",
+    pitch="Optional: a few words on why it's a good pick",
+)
 @app_commands.autocomplete(game=game_autocomplete)
-async def suggest(interaction: discord.Interaction, game: str, players: str | None = None):
+async def suggest(interaction: discord.Interaction, game: str, pitch: str | None = None):
+    pitch = " ".join(pitch.split()) if pitch else None  # collapse newlines/extra spaces
+
+    # Quick checks before we hit Steam (these replies are private to the user)
+    items = load_suggestions()
+    if len(items) >= MAX_POLL_ANSWERS:
+        await interaction.response.send_message(FULL_MESSAGE, ephemeral=True)
+        return
+    if pitch and len(pitch) > MAX_PITCH_LEN:
+        await interaction.response.send_message(
+            f"Your pitch is {len(pitch)} characters; the max is {MAX_PITCH_LEN}. Try trimming it.",
+            ephemeral=True,
+        )
+        return
+    if game.isdigit() and any(g.get("appid") == int(game) for g in items):
+        await interaction.response.send_message("That game is already on the list.", ephemeral=True)
+        return
+
     await interaction.response.defer()
     appid, name = None, game
 
@@ -248,21 +276,29 @@ async def suggest(interaction: discord.Interaction, game: str, players: str | No
         if results:
             appid, name = results[0]["id"], results[0]["name"]
 
-    items = load_suggestions()
+    items = load_suggestions()  # reload: the list may have changed while we waited on Steam
+    if len(items) >= MAX_POLL_ANSWERS:
+        await interaction.followup.send(FULL_MESSAGE)
+        return
     if any((appid and g.get("appid") == appid) or g["name"].lower() == name.lower() for g in items):
-        await interaction.followup.send(f"**{name}** is already on the list.", ephemeral=True)
+        await interaction.followup.send(f"**{name}** is already on the list.")
         return
 
     items.append({
         "appid": appid,
         "name": name,
-        "players": players,
+        "pitch": pitch,
         "suggested_by": interaction.user.display_name,
     })
     save_suggestions(items)
 
     note = "" if appid else " (not found on Steam, so no description will be shown)"
-    await interaction.followup.send(f"✅ **{name}** added by {interaction.user.display_name}{note}.")
+    msg = f"✅ **{name}** added by {interaction.user.display_name} ({len(items)}/{MAX_POLL_ANSWERS}){note}."
+    if pitch:
+        msg += f"\n> {pitch}"
+    if len(items) == MAX_POLL_ANSWERS:
+        msg += "\n⚠️ That was the last spot: the list is now full."
+    await interaction.followup.send(msg)
 
 
 @bot.tree.command(name="suggestions", description="Show current suggestions")
@@ -271,7 +307,8 @@ async def suggestions(interaction: discord.Interaction):
     if not items:
         await interaction.response.send_message("No suggestions yet. Use `/suggest`!", ephemeral=True)
         return
-    lines = [f"{i}. {g['name']} — {g['suggested_by']}" for i, g in enumerate(items, 1)]
+    lines = [f"**Suggestions ({len(items)}/{MAX_POLL_ANSWERS})**"]
+    lines += [f"{i}. {g['name']} — {g['suggested_by']}" for i, g in enumerate(items, 1)]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
