@@ -9,6 +9,8 @@ Monday Game Night Bot
 - Sunday 7:00 PM: posts a native Discord poll of the suggestions, followed by a
   message with each game's description, genre(s), and player info from Steam.
 - Monday 6:00 PM: reminder to vote, one hour before the poll closes.
+- When the poll closes, whoever suggested the winning game earns a point (a tie
+  gives every tied suggester a point). /leaderboard shows the standings.
 
 Setup:
     pip install -U discord.py aiohttp
@@ -24,6 +26,7 @@ and the "applications.commands" scope when you invite it.
 import asyncio
 import html
 import json
+import logging
 import os
 import re
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -48,10 +51,13 @@ VOTE_REMINDER_TIME = dtime(18, 0, tzinfo=TZ)        # Monday 6:00 PM (1 hour bef
 POLL_DURATION = timedelta(hours=24)  # poll closes Monday 7:00 PM; keep VOTE_REMINDER_TIME 1 hour earlier
 
 DATA_FILE = Path(os.environ.get("GAME_DATA_FILE", "suggestions.json"))
-STATE_FILE = DATA_FILE.with_name("poll_state.json")  # remembers the weekly poll for the vote reminder
+STATE_FILE = DATA_FILE.with_name("poll_state.json")  # remembers the weekly poll (reminder + scoring)
+SCORES_FILE = DATA_FILE.with_name("scores.json")     # {user_id: {"name": ..., "points": ...}}
 MAX_POLL_ANSWERS = 10     # Discord limit
 MAX_ANSWER_LEN = 55       # Discord limit for poll answer text
 MAX_PITCH_LEN = 200       # our own limit for the pitch
+
+log = logging.getLogger("discord.gamenightbot")  # child of discord.py's logger, so it reaches the journal
 
 FULL_MESSAGE = (
     f"🚫 The list is full ({MAX_POLL_ANSWERS}/{MAX_POLL_ANSWERS}). Discord polls hold at most "
@@ -100,6 +106,16 @@ def save_poll_state(state: dict | None) -> None:
         STATE_FILE.unlink(missing_ok=True)
     else:
         STATE_FILE.write_text(json.dumps(state))
+
+
+def load_scores() -> dict:
+    if SCORES_FILE.exists():
+        return json.loads(SCORES_FILE.read_text())
+    return {}
+
+
+def save_scores(scores: dict) -> None:
+    SCORES_FILE.write_text(json.dumps(scores, indent=2))
 
 
 # ------------------------------ Steam API ---------------------------------
@@ -161,6 +177,7 @@ class GameNightBot(discord.Client):
         self.suggestion_reminder.start()
         self.sunday_poll.start()
         self.vote_reminder.start()
+        self.tally_poll.start()
 
     async def close(self):
         if self.session:
@@ -181,7 +198,8 @@ class GameNightBot(discord.Client):
             "Use `/suggest` to add a game (start typing and pick from the Steam results), "
             "or `/suggest_nonsteam` for anything that isn't on Steam. "
             "Optionally add a short `pitch` on why it's a good pick.\n"
-            f"The list holds up to {MAX_POLL_ANSWERS} games, and the poll goes up **Sunday at 7:00 PM**."
+            f"The list holds up to {MAX_POLL_ANSWERS} games, and the poll goes up **Sunday at 7:00 PM**.\n"
+            "🏆 If your game wins, you earn a point (see `/leaderboard`)."
         )
 
     # ---- Sunday, 1 hour before the poll: last call for suggestions ----
@@ -236,7 +254,24 @@ class GameNightBot(discord.Client):
         for g in games:
             poll.add_answer(text=g["name"][:MAX_ANSWER_LEN])
         poll_message = await channel.send(poll=poll)
-        save_poll_state({"message_id": poll_message.id})  # for the Monday vote reminder
+
+        # Remember the poll so we can remind people to vote and award a point when it closes.
+        # Poll answers were added in the same order as `games`.
+        expires_at = poll_message.poll.expires_at if poll_message.poll else None
+        expires_at = expires_at or datetime.now(timezone.utc) + POLL_DURATION
+        save_poll_state({
+            "message_id": poll_message.id,
+            "expires_at": expires_at.isoformat(),
+            "games": [
+                {
+                    "name": g["name"],
+                    "suggested_by": g["suggested_by"],
+                    "suggested_by_id": g.get("suggested_by_id"),
+                }
+                for g in games
+            ],
+            "tallied": False,
+        })
 
         # Fetch Steam details in parallel
         details = await asyncio.gather(
@@ -298,10 +333,80 @@ class GameNightBot(discord.Client):
             f"Pick every game you'd be happy to play: {message.jump_url}"
         )
 
+    # ---- After the poll closes: find the winner(s) and award points ----
+    @tasks.loop(minutes=5)
+    async def tally_poll(self):
+        try:
+            await self._tally_poll()
+        except Exception:
+            log.exception("Tallying the poll failed; will retry")
+
+    async def _tally_poll(self):
+        state = load_poll_state()
+        if not state or state.get("tallied") or "games" not in state:
+            return
+        now = datetime.now(timezone.utc)
+        expires = datetime.fromisoformat(state["expires_at"])
+        if now < expires:
+            return  # still open
+        if now > expires + timedelta(hours=6):
+            state["tallied"] = True  # gave up waiting for Discord to finalise the poll
+            save_poll_state(state)
+            return
+
+        channel = await self.get_channel_safe()
+        try:
+            message = await channel.fetch_message(state["message_id"])
+        except discord.NotFound:
+            state["tallied"] = True  # the poll message was deleted
+            save_poll_state(state)
+            return
+        poll = message.poll
+        if poll is None or not poll.is_finalised():
+            return  # Discord hasn't finalised the counts yet; try again next time
+
+        results = [(g, a.vote_count) for g, a in zip(state["games"], poll.answers)]
+        top = max((votes for _, votes in results), default=0)
+        winners = [g for g, votes in results if top > 0 and votes == top]
+
+        # Award points and mark the poll as tallied back to back (no awaits in between),
+        # so a restart can't award the same poll twice.
+        scores = load_scores()
+        earners, seen = [], set()
+        for g in winners:
+            uid = g.get("suggested_by_id")
+            if uid is None or uid in seen:
+                continue  # suggested before points existed, or already credited this week
+            seen.add(uid)
+            entry = scores.setdefault(str(uid), {"name": g["suggested_by"], "points": 0})
+            entry["name"] = g["suggested_by"]
+            entry["points"] += 1
+            earners.append(g["suggested_by"])
+        save_scores(scores)
+        state["tallied"] = True
+        save_poll_state(state)
+
+        if not winners:
+            await channel.send("🏁 The poll closed with no votes, so no points this week.")
+            return
+        votes_text = f"{top} vote{'s' if top != 1 else ''}"
+        if len(winners) == 1:
+            parts = [f"🏆 **{winners[0]['name']}** wins with {votes_text}!"]
+        else:
+            names = " and ".join(f"**{g['name']}**" for g in winners)
+            parts = [f"🏆 It's a tie between {names} with {votes_text} each!"]
+        if len(earners) == 1:
+            parts.append(f"{earners[0]} earns a point.")
+        elif earners:
+            parts.append(f"{', '.join(earners)} each earn a point.")
+        parts.append("See `/leaderboard` for the standings.")
+        await channel.send(" ".join(parts))
+
     @friday_prompt.before_loop
     @suggestion_reminder.before_loop
     @sunday_poll.before_loop
     @vote_reminder.before_loop
+    @tally_poll.before_loop
     async def _wait_ready(self):
         await self.wait_until_ready()
 
@@ -351,6 +456,7 @@ async def add_suggestion(interaction: discord.Interaction, appid: int | None, na
         "name": name,
         "pitch": pitch,
         "suggested_by": interaction.user.display_name,
+        "suggested_by_id": interaction.user.id,
     })
     save_suggestions(items)
 
@@ -449,6 +555,23 @@ async def unsuggest(interaction: discord.Interaction, number: int):
     removed = items.pop(number - 1)
     save_suggestions(items)
     await interaction.response.send_message(f"Removed **{removed['name']}**.")
+
+
+@bot.tree.command(name="leaderboard", description="Who has had the most winning suggestions?")
+async def leaderboard(interaction: discord.Interaction):
+    scores = load_scores()
+    if not scores:
+        await interaction.response.send_message(
+            "No points yet. Suggest a game that wins the poll to get on the board!", ephemeral=True
+        )
+        return
+    ranked = sorted(scores.values(), key=lambda s: (-s["points"], s["name"].lower()))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 **Game Night Leaderboard**"]
+    for i, s in enumerate(ranked[:10]):
+        marker = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{marker} {s['name']}: {s['points']} point{'s' if s['points'] != 1 else ''}")
+    await interaction.response.send_message("\n".join(lines))
 
 
 if __name__ == "__main__":
